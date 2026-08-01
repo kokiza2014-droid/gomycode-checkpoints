@@ -1,0 +1,403 @@
+from __future__ import annotations
+
+import io
+import sqlite3
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+APP_DIR = Path(__file__).resolve().parent
+DB_FILE = APP_DIR / "simbox_dashboard.db"
+
+st.set_page_config(page_title="SIM Box Dashboard", page_icon="📡", layout="wide")
+
+DEFAULT_SETTINGS = {
+    "simbox_cost_per_minute": 5.0,
+    "retail_rate": 8.0,
+    "onnet_wholesale_rate_usd": 0.56,
+    "offnet_wholesale_rate_usd": 0.45,
+    "national_interco_rate_onnet": 0.68,
+    "national_interco_rate_offnet": 0.54,
+}
+
+
+def connect():
+    con = sqlite3.connect(DB_FILE)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    with connect() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS monthly_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_date TEXT NOT NULL UNIQUE,
+                usd_dzd REAL NOT NULL,
+                ooredoo_suspensions INTEGER DEFAULT 0,
+                ooredoo_minutes REAL DEFAULT 0,
+                ooredoo_calls INTEGER DEFAULT 0,
+                preventive_suspensions INTEGER DEFAULT 0,
+                djezzy_minutes REAL DEFAULT 0,
+                mobilis_from_ooredoo_minutes REAL DEFAULT 0,
+                fixed_minutes REAL DEFAULT 0,
+                loss_averted_usd REAL DEFAULT 0,
+                mobilis_distinct INTEGER DEFAULT 0,
+                mobilis_duration REAL DEFAULT 0,
+                mobilis_calls INTEGER DEFAULT 0,
+                ota_distinct INTEGER DEFAULT 0,
+                ota_duration REAL DEFAULT 0,
+                ota_calls INTEGER DEFAULT 0,
+                fixed_distinct INTEGER DEFAULT 0,
+                mou REAL DEFAULT 0,
+                ooredoo_total_minutes REAL DEFAULT 0,
+                onnet_risk_usd REAL DEFAULT 0,
+                mobilis_risk_usd REAL DEFAULT 0,
+                ota_risk_usd REAL DEFAULT 0,
+                total_risk_usd REAL DEFAULT 0,
+                offnet_minutes REAL DEFAULT 0,
+                total_minutes REAL DEFAULT 0,
+                notes TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value REAL NOT NULL
+            )
+        """)
+        for key, value in DEFAULT_SETTINGS.items():
+            con.execute(
+                "INSERT OR IGNORE INTO settings VALUES (?, ?)",
+                (key, value),
+            )
+
+
+def settings_load():
+    with connect() as con:
+        rows = con.execute("SELECT * FROM settings").fetchall()
+    return {r["setting_key"]: float(r["setting_value"]) for r in rows}
+
+
+def settings_save(values):
+    with connect() as con:
+        for key, value in values.items():
+            con.execute("""
+                INSERT INTO settings(setting_key, setting_value)
+                VALUES (?, ?)
+                ON CONFLICT(setting_key)
+                DO UPDATE SET setting_value=excluded.setting_value
+            """, (key, float(value)))
+
+
+def data_load():
+    with connect() as con:
+        return pd.read_sql_query(
+            "SELECT * FROM monthly_results ORDER BY record_date", con
+        )
+
+
+def data_save(data):
+    columns = list(data)
+    placeholders = ",".join("?" for _ in columns)
+    updates = ",".join(
+        f"{c}=excluded.{c}" for c in columns if c != "record_date"
+    )
+    sql = f"""
+        INSERT INTO monthly_results ({','.join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(record_date) DO UPDATE SET {updates}
+    """
+    with connect() as con:
+        con.execute(sql, [data[c] for c in columns])
+
+
+def safe_div(a, b):
+    return a / b if b else 0.0
+
+
+def calc_ooredoo(v, s):
+    offnet_duration = v["djezzy"] + v["mobilis"] + v["fixed"]
+    total_minutes = v["ooredoo"] + offnet_duration
+    mou = safe_div(total_minutes, v["calls"])
+    spend_dzd = total_minutes * s["simbox_cost_per_minute"]
+    expected_dzd = (
+        s["onnet_wholesale_rate_usd"] * v["usd_dzd"] * v["ooredoo"]
+    )
+    onnet_loss_usd = safe_div(expected_dzd - spend_dzd, v["usd_dzd"])
+    offnet_margin_dzd = offnet_duration * (
+        s["retail_rate"] - s["national_interco_rate_onnet"]
+    )
+    offnet_loss_usd = safe_div(offnet_margin_dzd, v["usd_dzd"])
+    return {
+        "offnet_duration": offnet_duration,
+        "total_minutes": total_minutes,
+        "mou": mou,
+        "risk_usd": onnet_loss_usd + offnet_loss_usd + v["loss_averted"],
+    }
+
+
+def calc_offnet(v, s):
+    wholesale_dzd = s["offnet_wholesale_rate_usd"] * v["usd_dzd"]
+    loss_dzd = (
+        wholesale_dzd - s["national_interco_rate_offnet"]
+    ) * v["duration"]
+    return {
+        "duration_per_sim": safe_div(v["duration"], v["distinct"]),
+        "risk_usd": safe_div(loss_dzd, v["usd_dzd"]),
+    }
+
+
+def excel_export(df):
+    out = io.BytesIO()
+    export = df.copy()
+    export["distinct_offnet"] = (
+        export["mobilis_distinct"] + export["ota_distinct"] + export["fixed_distinct"]
+    )
+    export["offnet_risk_usd"] = export["mobilis_risk_usd"] + export["ota_risk_usd"]
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        export.to_excel(writer, sheet_name="Donnees consolidees", index=False)
+        export[[
+            "record_date", "ooredoo_suspensions", "distinct_offnet",
+            "ota_distinct", "mobilis_distinct", "fixed_distinct",
+            "total_risk_usd", "onnet_risk_usd", "offnet_risk_usd",
+            "total_minutes", "ooredoo_total_minutes", "ota_duration",
+            "mobilis_duration", "offnet_minutes"
+        ]].to_excel(writer, sheet_name="Summary", index=False)
+    return out.getvalue()
+
+
+def read_sheet(uploaded, names, header=0):
+    for name in names:
+        try:
+            uploaded.seek(0)
+            return pd.read_excel(uploaded, sheet_name=name, header=header)
+        except ValueError:
+            pass
+    raise ValueError(f"Feuille introuvable: {names}")
+
+
+def n(row, column):
+    value = row.get(column, 0) if hasattr(row, "get") else 0
+    return 0.0 if pd.isna(value) else float(value)
+
+
+def import_excel(uploaded):
+    s = settings_load()
+    odf = read_sheet(uploaded, ["Ooredoo SB Loss"], header=1)
+    mdf = read_sheet(uploaded, ["Mobilis SB Loss"])
+    tdf = read_sheet(uploaded, ["OTA SB Loss ", "OTA SB Loss"])
+    count = 0
+    for _, r in odf.iterrows():
+        if pd.isna(r.get("Date")):
+            continue
+        month = pd.to_datetime(r["Date"]).strftime("%Y-%m")
+        usd = n(r, "USD - DZD ")
+        mmask = pd.to_datetime(mdf["Date"], errors="coerce").dt.strftime("%Y-%m") == month
+        tmask = pd.to_datetime(tdf["Date"], errors="coerce").dt.strftime("%Y-%m") == month
+        mr = mdf[mmask].iloc[0] if mmask.any() else {}
+        tr = tdf[tmask].iloc[0] if tmask.any() else {}
+
+        ov = {
+            "usd_dzd": usd,
+            "ooredoo": n(r, "terminated to Ooredoo  (min)"),
+            "calls": int(n(r, "Number of calls")),
+            "djezzy": n(r, "terminated to Djezzy   (min)"),
+            "mobilis": n(r, "terminated to Mobilis    (min)"),
+            "fixed": n(r, "terminated to Fixe        (min)"),
+            "loss_averted": n(r, "Loss Averted"),
+        }
+        mv = {
+            "usd_dzd": usd,
+            "distinct": int(n(mr, "Number of distinct SB-Mobilis")),
+            "duration": n(mr, "Mobilis Terminated Duration"),
+        }
+        tv = {
+            "usd_dzd": usd,
+            "distinct": int(n(tr, "Number of distinct SB-OTA")),
+            "duration": n(tr, "OTA Terminated Duration"),
+        }
+        oc, mc, tc = calc_ooredoo(ov, s), calc_offnet(mv, s), calc_offnet(tv, s)
+        offnet_minutes = mv["duration"] + tv["duration"]
+        data_save({
+            "record_date": month,
+            "usd_dzd": usd,
+            "ooredoo_suspensions": int(n(r, "Number of Suspension")),
+            "ooredoo_minutes": ov["ooredoo"],
+            "ooredoo_calls": ov["calls"],
+            "preventive_suspensions": int(n(r, "Number of Suspension preventives")),
+            "djezzy_minutes": ov["djezzy"],
+            "mobilis_from_ooredoo_minutes": ov["mobilis"],
+            "fixed_minutes": ov["fixed"],
+            "loss_averted_usd": ov["loss_averted"],
+            "mobilis_distinct": mv["distinct"],
+            "mobilis_duration": mv["duration"],
+            "mobilis_calls": int(n(mr, "Mobilis-Number of calls")),
+            "ota_distinct": tv["distinct"],
+            "ota_duration": tv["duration"],
+            "ota_calls": int(n(tr, "OTA-Number of calls")),
+            "fixed_distinct": 0,
+            "mou": oc["mou"],
+            "ooredoo_total_minutes": oc["total_minutes"],
+            "onnet_risk_usd": oc["risk_usd"],
+            "mobilis_risk_usd": mc["risk_usd"],
+            "ota_risk_usd": tc["risk_usd"],
+            "total_risk_usd": oc["risk_usd"] + mc["risk_usd"] + tc["risk_usd"],
+            "offnet_minutes": offnet_minutes,
+            "total_minutes": oc["total_minutes"] + offnet_minutes,
+            "notes": "Importe depuis le fichier historique",
+        })
+        count += 1
+    return count
+
+
+init_db()
+st.title("📡 SIM Box Detection Dashboard")
+st.caption("Suivi mensuel des détections SIM Box On-net et Off-net")
+
+page = st.sidebar.radio(
+    "Navigation",
+    ["Saisie mensuelle", "Import Excel", "Historique", "Dashboard", "Paramètres"],
+)
+
+if page == "Saisie mensuelle":
+    st.header("Saisie mensuelle")
+    s = settings_load()
+    with st.form("monthly_form"):
+        c1, c2 = st.columns(2)
+        month = c1.date_input("Mois", value=date.today().replace(day=1))
+        usd = c2.number_input("Taux USD → DZD", min_value=0.01, value=135.0)
+
+        st.subheader("Ooredoo / On-net")
+        a, b, c, d = st.columns(4)
+        susp = a.number_input("Number of Suspension", min_value=0, step=1)
+        prev = a.number_input("Suspensions préventives", min_value=0, step=1)
+        omin = b.number_input("Terminated to Ooredoo (min)", min_value=0.0)
+        ocalls = b.number_input("Number of calls", min_value=0, step=1)
+        dmin = c.number_input("Terminated to Djezzy (min)", min_value=0.0)
+        mfromo = c.number_input("Terminated to Mobilis (min)", min_value=0.0)
+        fmin = d.number_input("Terminated to Fixe (min)", min_value=0.0)
+        loss = d.number_input("Loss Averted (USD)", min_value=0.0)
+
+        st.subheader("Mobilis / Off-net")
+        a, b, c = st.columns(3)
+        mdist = a.number_input("Distinct SB-Mobilis", min_value=0, step=1)
+        mdur = b.number_input("Mobilis Terminated Duration", min_value=0.0)
+        mcalls = c.number_input("Mobilis Number of calls", min_value=0, step=1)
+
+        st.subheader("OTA / Djezzy / Off-net")
+        a, b, c, d = st.columns(4)
+        tdist = a.number_input("Distinct SB-OTA", min_value=0, step=1)
+        tdur = b.number_input("OTA Terminated Duration", min_value=0.0)
+        tcalls = c.number_input("OTA Number of calls", min_value=0, step=1)
+        fdist = d.number_input("Algérie Télécom Fixe", min_value=0, step=1)
+        notes = st.text_area("Commentaire")
+        submit = st.form_submit_button("Calculer et enregistrer", use_container_width=True)
+
+    if submit:
+        ov = {"usd_dzd": usd, "ooredoo": omin, "calls": ocalls, "djezzy": dmin,
+              "mobilis": mfromo, "fixed": fmin, "loss_averted": loss}
+        mv = {"usd_dzd": usd, "distinct": mdist, "duration": mdur}
+        tv = {"usd_dzd": usd, "distinct": tdist, "duration": tdur}
+        oc, mc, tc = calc_ooredoo(ov, s), calc_offnet(mv, s), calc_offnet(tv, s)
+        offnet_minutes = mdur + tdur
+        total_risk = oc["risk_usd"] + mc["risk_usd"] + tc["risk_usd"]
+        data_save({
+            "record_date": month.strftime("%Y-%m"), "usd_dzd": usd,
+            "ooredoo_suspensions": susp, "ooredoo_minutes": omin,
+            "ooredoo_calls": ocalls, "preventive_suspensions": prev,
+            "djezzy_minutes": dmin, "mobilis_from_ooredoo_minutes": mfromo,
+            "fixed_minutes": fmin, "loss_averted_usd": loss,
+            "mobilis_distinct": mdist, "mobilis_duration": mdur,
+            "mobilis_calls": mcalls, "ota_distinct": tdist,
+            "ota_duration": tdur, "ota_calls": tcalls,
+            "fixed_distinct": fdist, "mou": oc["mou"],
+            "ooredoo_total_minutes": oc["total_minutes"],
+            "onnet_risk_usd": oc["risk_usd"], "mobilis_risk_usd": mc["risk_usd"],
+            "ota_risk_usd": tc["risk_usd"], "total_risk_usd": total_risk,
+            "offnet_minutes": offnet_minutes,
+            "total_minutes": oc["total_minutes"] + offnet_minutes,
+            "notes": notes,
+        })
+        st.success("Données enregistrées.")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("MoU", f"{oc['mou']:,.2f}")
+        k2.metric("Minutes", f"{oc['total_minutes'] + offnet_minutes:,.0f}")
+        k3.metric("On-net Risk", f"{oc['risk_usd']:,.2f} USD")
+        k4.metric("Total Risk", f"{total_risk:,.2f} USD")
+
+elif page == "Import Excel":
+    st.header("Import du fichier historique")
+    uploaded = st.file_uploader("Fichier Excel", type=["xlsx", "xls"])
+    if uploaded and st.button("Importer", type="primary", use_container_width=True):
+        try:
+            st.success(f"{import_excel(uploaded)} mois importés ou mis à jour.")
+        except Exception as exc:
+            st.error(f"Erreur d'import : {exc}")
+
+elif page == "Historique":
+    st.header("Historique")
+    df = data_load()
+    if df.empty:
+        st.warning("Aucune donnée.")
+    else:
+        view = df.copy()
+        view["distinct_offnet"] = view["mobilis_distinct"] + view["ota_distinct"] + view["fixed_distinct"]
+        view["offnet_risk_usd"] = view["mobilis_risk_usd"] + view["ota_risk_usd"]
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Télécharger en Excel", excel_export(df),
+            file_name="simbox_dashboard_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        choices = {f"{r.record_date} — ID {int(r.id)}": int(r.id) for _, r in df.iterrows()}
+        selected = st.selectbox("Ligne à supprimer", list(choices))
+        if st.button("Supprimer"):
+            with connect() as con:
+                con.execute("DELETE FROM monthly_results WHERE id=?", (choices[selected],))
+            st.success("Ligne supprimée.")
+            st.rerun()
+
+elif page == "Dashboard":
+    st.header("Dashboard")
+    df = data_load()
+    if df.empty:
+        st.warning("Aucune donnée.")
+    else:
+        df["offnet_risk_usd"] = df["mobilis_risk_usd"] + df["ota_risk_usd"]
+        df["total_cases"] = df["ooredoo_suspensions"] + df["mobilis_distinct"] + df["ota_distinct"] + df["fixed_distinct"]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total cas", f"{df['total_cases'].sum():,.0f}")
+        k2.metric("Total minutes", f"{df['total_minutes'].sum():,.0f}")
+        k3.metric("Revenue at Risk", f"{df['total_risk_usd'].sum():,.0f} USD")
+        k4.metric("MoU moyen", f"{df['mou'].mean():,.2f}")
+        fig1 = px.line(df, x="record_date", y=["ooredoo_total_minutes", "offnet_minutes", "total_minutes"], markers=True, title="Évolution des minutes")
+        st.plotly_chart(fig1, use_container_width=True)
+        risk = df[["record_date", "onnet_risk_usd", "offnet_risk_usd"]].melt("record_date", var_name="Type", value_name="USD")
+        fig2 = px.bar(risk, x="record_date", y="USD", color="Type", barmode="group", title="Revenue at Risk On-net vs Off-net")
+        st.plotly_chart(fig2, use_container_width=True)
+        cases = df[["record_date", "ooredoo_suspensions", "mobilis_distinct", "ota_distinct", "fixed_distinct"]].melt("record_date", var_name="Réseau", value_name="Cas")
+        fig3 = px.bar(cases, x="record_date", y="Cas", color="Réseau", title="Cas détectés par réseau")
+        st.plotly_chart(fig3, use_container_width=True)
+
+else:
+    st.header("Paramètres")
+    current = settings_load()
+    with st.form("settings"):
+        values = {
+            "simbox_cost_per_minute": st.number_input("Coût SIM Box/min (DZD)", min_value=0.0, value=current["simbox_cost_per_minute"]),
+            "retail_rate": st.number_input("Tarif retail/min (DZD)", min_value=0.0, value=current["retail_rate"]),
+            "onnet_wholesale_rate_usd": st.number_input("Wholesale On-net (USD/min)", min_value=0.0, value=current["onnet_wholesale_rate_usd"]),
+            "offnet_wholesale_rate_usd": st.number_input("Wholesale Off-net (USD/min)", min_value=0.0, value=current["offnet_wholesale_rate_usd"]),
+            "national_interco_rate_onnet": st.number_input("Interco On-net (DZD/min)", min_value=0.0, value=current["national_interco_rate_onnet"]),
+            "national_interco_rate_offnet": st.number_input("Interco Off-net (DZD/min)", min_value=0.0, value=current["national_interco_rate_offnet"]),
+        }
+        submitted = st.form_submit_button("Enregistrer", use_container_width=True)
+    if submitted:
+        settings_save(values)
+        st.success("Paramètres enregistrés.")
+    st.warning("Valider les paramètres financiers avant utilisation officielle.")
